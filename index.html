@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>Mobile Racer (HTML5)</title>
+<style>
+  html,body { height:100%; margin:0; background:#111; -webkit-user-select:none; user-select:none; }
+  #gameWrap { position:relative; width:100%; height:100vh; overflow:hidden; touch-action:none; }
+  canvas { background:#444; display:block; margin:0 auto; }
+  #ui {
+    position:absolute; left:0; right:0; top:12px; display:flex; justify-content:space-between;
+    padding:0 14px; pointer-events:none; color:#fff; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;
+    font-weight:600; font-size:18px; text-shadow:0 1px 2px rgba(0,0,0,0.6);
+  }
+  #score { pointer-events:auto; }
+  #gameOver {
+    position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+    background:rgba(0,0,0,0.75); color:#fff; padding:18px 20px; border-radius:12px; text-align:center;
+    display:none; pointer-events:auto;
+  }
+  #restartBtn {
+    margin-top:10px; padding:8px 12px; border-radius:8px; background:#1e90ff; color:#fff; border:none;
+    font-weight:700; font-size:16px;
+  }
+  /* make canvas scale nicely on wide screens */
+  @media (min-aspect-ratio:9/16) {
+    canvas { height:100vh; width:auto; }
+  }
+</style>
+</head>
+<body>
+<div id="gameWrap">
+  <div id="ui">
+    <div id="score">Score: 0</div>
+    <div id="speed">Speed: 1.0x</div>
+  </div>
+  <canvas id="c"></canvas>
+  <div id="gameOver">
+    <div id="gameOverText">Game Over</div>
+    <div id="finalScore">Score: 0</div>
+    <button id="restartBtn">Restart</button>
+  </div>
+</div>
+
+<script>
+// ---- Config ----
+const VIRTUAL_WIDTH = 360;   // logical width (kept consistent across devices)
+const VIRTUAL_HEIGHT = 640;  // logical height
+const LANE_LIMIT = 120;      // how far player can move left/right (in logical coords)
+const PLAYER_W = 48, PLAYER_H = 80;
+const OB_W = 46, OB_H = 78;
+const BASE_SCROLL_SPEED = 260; // pixels/sec
+const SPAWN_INTERVAL_START = 1.2; // seconds
+const DIFFICULTY_RAMP = 0.0008; // increases difficulty per frame
+
+// ---- Canvas setup ----
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false });
+let scale = 1, offsetX = 0, offsetY = 0;
+function resizeCanvas() {
+  const wrap = document.getElementById('gameWrap');
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  // Fit to window while preserving aspect ratio of virtual resolution
+  const scaleW = w / VIRTUAL_WIDTH, scaleH = h / VIRTUAL_HEIGHT;
+  scale = Math.min(scaleW, scaleH);
+  canvas.width = Math.floor(VIRTUAL_WIDTH * scale);
+  canvas.height = Math.floor(VIRTUAL_HEIGHT * scale);
+  canvas.style.width = canvas.width + 'px';
+  canvas.style.height = canvas.height + 'px';
+  // center canvas if letterboxed
+  offsetX = Math.floor((w - canvas.width) / 2);
+  offsetY = Math.floor((h - canvas.height) / 2);
+  canvas.style.marginLeft = offsetX + 'px';
+  canvas.style.marginTop = offsetY + 'px';
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// ---- Input (touch/pointer) ----
+let currentTouchX = null;
+canvas.addEventListener('pointerdown', e => { e.preventDefault(); currentTouchX = e.clientX; handlePointer(e.clientX); });
+canvas.addEventListener('pointermove', e => { e.preventDefault(); /* optionally track swipe */ });
+canvas.addEventListener('pointerup', e => { e.preventDefault(); currentTouchX = null; });
+function handlePointer(clientX) {
+  // convert clientX to canvas logical coordinate
+  const rect = canvas.getBoundingClientRect();
+  const x = (clientX - rect.left) / scale;
+  // set steering target left (-1), right (+1)
+  steering = (x < VIRTUAL_WIDTH/2) ? -1 : 1;
+  steeringTimeout = Date.now() + 180; // apply for a short window so taps feel responsive
+}
+
+// Also support keyboard for desktop testing
+let keyLeft=false, keyRight=false;
+window.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft' || e.key === 'a') keyLeft=true;
+  if (e.key === 'ArrowRight' || e.key === 'd') keyRight=true;
+});
+window.addEventListener('keyup', e => {
+  if (e.key === 'ArrowLeft' || e.key === 'a') keyLeft=false;
+  if (e.key === 'ArrowRight' || e.key === 'd') keyRight=false;
+});
+
+// ---- Game state ----
+let scoreEl = document.getElementById('score');
+let speedEl = document.getElementById('speed');
+let gameOverPanel = document.getElementById('gameOver');
+let finalScoreEl = document.getElementById('finalScore');
+let restartBtn = document.getElementById('restartBtn');
+
+restartBtn.addEventListener('click', restart);
+
+let lastTime = 0;
+let running = true;
+let offset = 0; // road scroll offset (pixels)
+let scrollSpeed = BASE_SCROLL_SPEED;
+let spawnInterval = SPAWN_INTERVAL_START;
+let spawnTimer = spawnInterval;
+let obstacles = [];
+let steering = 0;       // -1 left, 0 none, +1 right
+let steeringTimeout = 0;
+
+// Player state: logical coords (0,0 center)
+let player = {
+  x: 0,
+  y: VIRTUAL_HEIGHT/2 + 160, // bottom area
+  w: PLAYER_W,
+  h: PLAYER_H,
+  speed: 360 // horizontal pixels/sec
+};
+
+// Helpers
+function randRange(a,b){ return a + Math.random()*(b-a); }
+function rectsOverlap(a,b){
+  return !(a.x + a.w < b.x || a.x > b.x + b.w || a.y + a.h < b.y || a.y > b.y + b.h);
+}
+
+// Reset / start
+function resetGame(){
+  running = true;
+  offset = 0;
+  scrollSpeed = BASE_SCROLL_SPEED;
+  obstacles = [];
+  spawnInterval = SPAWN_INTERVAL_START;
+  spawnTimer = spawnInterval;
+  score = 0;
+  player.x = 0;
+  gameOverPanel.style.display = 'none';
+  lastTime = performance.now();
+  getHighDPI(); // ensure crisp
+}
+function restart(){ resetGame(); loop(performance.now()); }
+
+// High-DPI rendering adjustments
+function getHighDPI(){
+  // Canvas already scaled in CSS; draw at logical resolution and scale transforms instead of resizing backing store.
+  // We'll draw in logical coords and scale to actual pixels via ctx.setTransform
+  const backingScale = scale;
+  ctx.setTransform(backingScale, 0, 0, backingScale, 0, 0);
+}
+getHighDPI();
+
+let score = 0;
+
+// Spawn obstacle
+function spawnObstacle(){
+  const laneX = randRange(-LANE_LIMIT, LANE_LIMIT);
+  const ob = {
+    x: laneX - OB_W/2,
+    y: -OB_H - 30,
+    w: OB_W,
+    h: OB_H,
+    speed: scrollSpeed + randRange(20,120), // relative speed
+    color: '#d33'
+  };
+  obstacles.push(ob);
+}
+
+// Game over
+function doGameOver(){
+  running = false;
+  gameOverPanel.style.display = 'block';
+  finalScoreEl.textContent = 'Score: ' + Math.floor(score);
+}
+
+// Main loop
+function loop(t){
+  if (!lastTime) lastTime = t;
+  const dt = Math.min((t - lastTime) / 1000, 0.033); // clamp dt
+  lastTime = t;
+
+  if (running) {
+    // update difficulty over time
+    scrollSpeed += DIFFICULTY_RAMP * (dt * 1000) * 60; // subtle ramp
+    spawnInterval = Math.max(0.45, spawnInterval - DIFFICULTY_RAMP * 30); // reduce spawn interval slowly
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) {
+      spawnObstacle();
+      spawnTimer = spawnInterval;
+    }
+
+    // scoring
+    score += dt * 12;
+    scoreEl.textContent = 'Score: ' + Math.floor(score);
+    speedEl.textContent = 'Speed: ' + (scrollSpeed / BASE_SCROLL_SPEED).toFixed(2) + 'x';
+
+    // road offset
+    offset += scrollSpeed * dt;
+    if (offset > VIRTUAL_HEIGHT) offset -= VIRTUAL_HEIGHT;
+
+    // input handling
+    if (Date.now() > steeringTimeout) steering = 0; // expire taps
+    let inputX = steering;
+    if (keyLeft) inputX = -1;
+    if (keyRight) inputX = 1;
+    // move player
+    player.x += inputX * player.speed * dt;
+    // clamp
+    player.x = Math.max(-LANE_LIMIT, Math.min(LANE_LIMIT, player.x));
+
+    // update obstacles
+    for (let i = obstacles.length - 1; i >= 0; --i) {
+      const o = obstacles[i];
+      o.y += o.speed * dt;
+      // collision check (convert player rect to screen coords)
+      const playerRect = {
+        x: (VIRTUAL_WIDTH/2 + player.x) - player.w/2,
+        y: player.y - player.h/2,
+        w: player.w,
+        h: player.h
+      };
+      const obRect = { x: (VIRTUAL_WIDTH/2 + o.x), y: o.y, w: o.w, h: o.h };
+      if (rectsOverlap(playerRect, obRect)) {
+        doGameOver();
+        break;
+      }
+      if (o.y > VIRTUAL_HEIGHT + 100) {
+        obstacles.splice(i,1);
+      }
+    }
+  }
+
+  // ---- Drawing ----
+  // clear (logical coords)
+  ctx.fillStyle = '#2b2b2b';
+  ctx.fillRect(0,0,VIRTUAL_WIDTH,VIRTUAL_HEIGHT);
+
+  // draw road: center vertical stripe and lane markers using offset loop
+  const roadW = VIRTUAL_WIDTH * 0.72;
+  const roadX = (VIRTUAL_WIDTH - roadW) / 2;
+  // road background
+  roundRect(ctx, roadX, 0, roadW, VIRTUAL_HEIGHT, 18, '#333');
+  // center dashed line
+  ctx.fillStyle = '#f6f6f6';
+  const dashH = 36, gapH = 24;
+  const centerX = VIRTUAL_WIDTH/2 - 4;
+  for (let y = - (offset % (dashH + gapH)); y < VIRTUAL_HEIGHT; y += dashH + gapH) {
+    ctx.fillRect(centerX, y, 8, dashH);
+  }
+  // side lines
+  ctx.fillStyle = '#eaeaea';
+  ctx.fillRect(roadX, 0, 4, VIRTUAL_HEIGHT);
+  ctx.fillRect(roadX + roadW - 4, 0, 4, VIRTUAL_HEIGHT);
+
+  // draw player (simple car shape)
+  const px = VIRTUAL_WIDTH/2 + player.x - player.w/2;
+  const py = player.y - player.h/2;
+  drawCar(ctx, px, py, player.w, player.h, '#19a6f3', '#08354a');
+
+  // draw obstacles
+  for (const o of obstacles) {
+    const ox = VIRTUAL_WIDTH/2 + o.x;
+    const oy = o.y;
+    drawCar(ctx, ox, oy, o.w, o.h, o.color, '#670000');
+  }
+
+  // optionally draw HUD crosshair for debugging
+  // ctx.fillStyle='rgba(255,255,255,0.1)'; ctx.fillRect(VIRTUAL_WIDTH/2-1,0,2,VIRTUAL_HEIGHT);
+
+  if (running) requestAnimationFrame(loop);
+  else { /* still render last frame but don't request next */ }
+}
+
+// utility: rounded rect
+function roundRect(ctx,x,y,w,h,r, fillStyle){
+  ctx.fillStyle = fillStyle;
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y, x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x, y+h, r);
+  ctx.arcTo(x, y+h, x, y, r);
+  ctx.arcTo(x, y, x+w, y, r);
+  ctx.closePath();
+  ctx.fill();
+}
+// utility: draw car (simple top-down)
+function drawCar(ctx,x,y,w,h, mainColor, trim){
+  // body
+  roundRect(ctx, x, y, w, h, Math.min(10, w*0.08), mainColor);
+  // windshield
+  ctx.fillStyle = trim;
+  ctx.fillRect(x + w*0.15, y + h*0.08, w*0.7, h*0.28);
+  // windows
+  ctx.fillStyle = 'rgba(255,255,255,0.1)';
+  ctx.fillRect(x + w*0.2, y + h*0.42, w*0.6, h*0.12);
+  // headlights (bottom)
+  ctx.fillStyle = '#ffd280';
+  ctx.fillRect(x + w*6/32, y + h*0.78, w*0.12, h*0.12);
+  ctx.fillRect(x + w*22/32, y + h*0.78, w*0.12, h*0.12);
+}
+
+// Start game
+resetGame();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
